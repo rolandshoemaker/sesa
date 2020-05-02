@@ -3,10 +3,6 @@ package main
 import (
 	"bytes"
 	"crypto"
-	"path/filepath"
-
-	// "crypto/sha256"
-	// "crypto/x509"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"errors"
@@ -17,6 +13,7 @@ import (
 	"math/big"
 	"net"
 	"os"
+	"path/filepath"
 	"unsafe"
 
 	"golang.org/x/crypto/ssh"
@@ -117,7 +114,6 @@ func getKeys() ([]seKey, error) {
 	defer C.CFRelease(C.CFTypeRef(query))
 	ret := C.SecItemCopyMatching(query, &data)
 	if ret != C.errSecSuccess {
-		// use SecCopyErrorMessageString to get a real error
 		appleErr := C.SecCopyErrorMessageString(ret, C.NULL)
 		defer C.CFRelease(C.CFTypeRef(appleErr))
 		cStr := C.CFStringGetCStringPtr(appleErr, C.kCFStringEncodingUTF8)
@@ -215,7 +211,7 @@ func (a *seAgent) Sign(key ssh.PublicKey, data []byte) (*ssh.Signature, error) {
 			if err != nil {
 				return nil, err
 			}
-			return signer.(ssh.AlgorithmSigner).Sign(nil, data)
+			return signer.Sign(nil, data)
 		}
 	}
 
@@ -281,6 +277,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("failed to listen on %q: %s\n", *sockPath, err)
 	}
+	log.Printf("Listening on %q\n", *sockPath)
 
 	a := &seAgent{}
 
@@ -290,7 +287,7 @@ func main() {
 			log.Printf("failed to accept connection: %s\n", err)
 		}
 		if err := agent.ServeAgent(a, conn); err != nil && err != io.EOF {
-			log.Printf("failed to serve connection: %s\n", err)
+			log.Printf("failed to serve request: %s\n", err)
 		}
 	}
 }
