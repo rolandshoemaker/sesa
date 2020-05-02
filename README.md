@@ -1,6 +1,6 @@
 # sesa - Secure Enclave powered SSH Agent
 
-> **WARNING:** my lack of objective-c experience is only rivaled by my lack of macOS API experience, be warned, this code may not work the way you expect it to.
+> **WARNING:** my lack of objective-c experience is only rivaled by my lack of macOS API experience, be warned, this code may not work the way you expect it to, or I intend it to.
 
 Usage should be pretty straight forward:
 
