@@ -72,11 +72,11 @@ func getAppleError(appleErr C.CFErrorRef) string {
 }
 
 func (sk *seKey) Sign(rand io.Reader, digest []byte, opts crypto.SignerOpts) (signature []byte, err error) {
-	var appleErr C.CFErrorRef
 	cDigest := C.CBytes(digest)
 	cfDigest := C.CFDataCreate(C.kCFAllocatorDefault, (*C.uchar)(cDigest), C.CFIndex(len(digest)))
 	defer C.CFRelease(C.CFTypeRef(cfDigest))
 	defer C.free(cDigest) // do i need to do both?
+	var appleErr C.CFErrorRef
 	cfSig := C.SecKeyCreateSignature(sk.ref, C.kSecKeyAlgorithmECDSASignatureDigestX962SHA256, cfDigest, &appleErr)
 	if cfSig == 0 || appleErr != 0 {
 		fmt.Println("bad bad bad", appleErr)
