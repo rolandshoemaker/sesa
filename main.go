@@ -78,7 +78,7 @@ func (sk *seKey) Sign(rand io.Reader, digest []byte, opts crypto.SignerOpts) (si
 	defer C.CFRelease(C.CFTypeRef(cfDigest))
 	defer C.free(cDigest) // do i need to do both?
 	cfSig := C.SecKeyCreateSignature(sk.ref, C.kSecKeyAlgorithmECDSASignatureDigestX962SHA256, cfDigest, &appleErr)
-	if cfSig == 0 {
+	if cfSig == 0 || appleErr != 0 {
 		fmt.Println("bad bad bad", appleErr)
 		return nil, fmt.Errorf("SecKeyCreateSignature failed: %s", getAppleError(appleErr))
 	}
@@ -150,7 +150,7 @@ func getKeys() ([]seKey, error) {
 		}
 		var appleErr C.CFErrorRef
 		cfData := C.SecKeyCopyExternalRepresentation(pubRefP, &appleErr)
-		if cfData == 0 {
+		if cfData == 0 || appleErr != 0 {
 			// typically this is going to be because we aren't authorized to extract the public
 			// key, just ignore and move on (we could log, but it's not going to be very
 			// useful)
