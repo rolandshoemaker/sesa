@@ -1,9 +1,17 @@
 package main
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"encoding/hex"
+	"errors"
+	"flag"
 	"fmt"
+	"math/big"
 	"os"
 	"unsafe"
+
+	"golang.org/x/crypto/ssh"
 )
 
 /*
@@ -25,12 +33,36 @@ NSObject* accessControl(CFTypeRef protection, SecAccessControlCreateFlags flags)
        	CFRelease(error);
         return NULL;
 	}
-	
+
 	return (__bridge id)access;
 }
 
 */
 import "C"
+
+func getAppleError(appleErr C.CFErrorRef) string {
+	cfStr := C.CFErrorCopyDescription(appleErr)
+	defer C.CFRelease(C.CFTypeRef(cfStr))
+	cStr := C.CFStringGetCStringPtr(cfStr, C.kCFStringEncodingUTF8)
+	if cStr == nil {
+		return "failed to read apple error"
+	}
+	C.CFRelease(C.CFTypeRef(appleErr))
+	return C.GoString(cStr)
+}
+
+// parseANSIPub parses a ANSI X9.63 format public key
+func parseANSIPub(b []byte) (*ecdsa.PublicKey, error) {
+	if len(b) != 65 {
+		return nil, errors.New("unexpected key length")
+	}
+	xBytes, yBytes := b[1:33], b[33:]
+	return &ecdsa.PublicKey{
+		Curve: elliptic.P256(),
+		X:     big.NewInt(0).SetBytes(xBytes),
+		Y:     big.NewInt(0).SetBytes(yBytes),
+	}, nil
+}
 
 func dictToCFDict(m map[C.CFStringRef]interface{}) C.CFDictionaryRef {
 	var keys, values []unsafe.Pointer
@@ -47,6 +79,8 @@ func dictToCFDict(m map[C.CFStringRef]interface{}) C.CFDictionaryRef {
 			values = append(values, unsafe.Pointer(t))
 		case C.idx:
 			values = append(values, unsafe.Pointer(t))
+		case C.CFDataRef:
+			values = append(values, unsafe.Pointer(t))
 		case *C.NSObject:
 			values = append(values, unsafe.Pointer(t))
 		default:
@@ -56,7 +90,7 @@ func dictToCFDict(m map[C.CFStringRef]interface{}) C.CFDictionaryRef {
 	return C.CFDictionaryCreate(C.kCFAllocatorDefault, &keys[0], &values[0], C.CFIndex(len(m)), &C.kCFTypeDictionaryKeyCallBacks, &C.kCFTypeDictionaryValueCallBacks)
 }
 
-func main() {
+func generateKey(keyLabel string) {
 	var appleErr C.CFErrorRef
 	accessRef := C.SecAccessControlCreateWithFlags(
 		C.kCFAllocatorDefault,
@@ -70,8 +104,7 @@ func main() {
 	}
 	defer C.CFRelease(C.CFTypeRef(accessRef))
 
-
-	cfLabel := C.CFStringCreateWithCString(C.kCFAllocatorDefault, C.CString("sesa-testing-3"), C.kCFStringEncodingASCII)
+	cfLabel := C.CFStringCreateWithCString(C.kCFAllocatorDefault, C.CString(keyLabel), C.kCFStringEncodingASCII)
 	if cfLabel == 0 {
 		panic("couldn't create label")
 	}
@@ -84,7 +117,7 @@ func main() {
 	}
 
 	attrs := dictToCFDict(map[C.CFStringRef]interface{}{
-		C.kSecAttrTokenID:      C.kSecAttrTokenIDSecureEnclave,
+		C.kSecAttrTokenID:       C.kSecAttrTokenIDSecureEnclave,
 		C.kSecAttrKeyType:       C.kSecAttrKeyTypeECSECPrimeRandom,
 		C.kSecAttrKeySizeInBits: C.idx(cfBits),
 		C.kSecAttrLabel:         C.idx(cfLabel),
@@ -93,8 +126,8 @@ func main() {
 			// presumably there is a more idiomatic way to do this
 			// but for the life of me i can't figure it out...
 			C.kSecAttrAccessControl: C.accessControl(
-				C.CFTypeRef(C.kSecAttrAccessibleWhenUnlockedThisDeviceOnly),
-				C.kSecAccessControlPrivateKeyUsage & C.kSecAccessControlBiometryAny,
+				C.CFTypeRef(C.kSecAttrAccessibleWhenPasscodeSetThisDeviceOnly),
+				C.kSecAccessControlPrivateKeyUsage|C.kSecAccessControlTouchIDAny,
 			),
 		}),
 	})
@@ -102,8 +135,7 @@ func main() {
 
 	privRef := C.SecKeyCreateRandomKey(attrs, &appleErr)
 	if privRef == 0 || appleErr != 0 {
-		C.CFShow(C.CFTypeRef(appleErr))
-		panic("couldn't create key")
+		panic(getAppleError(appleErr))
 	}
 	defer C.CFRelease(C.CFTypeRef(privRef))
 
@@ -113,6 +145,26 @@ func main() {
 	}
 	defer C.CFRelease(C.CFTypeRef(pubRef))
 
+	cfData := C.SecKeyCopyExternalRepresentation(pubRef, &appleErr)
+	if cfData == 0 || appleErr != 0 {
+		panic(getAppleError(appleErr))
+	}
+	derStart := C.CFDataGetBytePtr(cfData)
+	der := C.GoBytes(unsafe.Pointer(derStart), C.int(C.CFDataGetLength(cfData)))
+	C.CFRelease(C.CFTypeRef(cfData))
+
+	gk, err := parseANSIPub(der)
+	if err != nil {
+		panic(err)
+	}
+	sshPK, err := ssh.NewPublicKey(gk)
+	if err != nil {
+		panic(err)
+	}
+	fmt.Print(string(ssh.MarshalAuthorizedKey(sshPK)))
+}
+
+func listKeys() {
 	var data C.CFTypeRef
 	query := dictToCFDict(map[C.CFStringRef]interface{}{
 		C.kSecAttrTokenID:      C.kSecAttrTokenIDSecureEnclave,
@@ -126,6 +178,10 @@ func main() {
 	defer C.CFRelease(C.CFTypeRef(query))
 	ret := C.SecItemCopyMatching(query, &data)
 	if ret != C.errSecSuccess {
+		if ret == -25300 {
+			fmt.Println("no keys found")
+			return
+		}
 		appleErr := C.SecCopyErrorMessageString(ret, C.NULL)
 		defer C.CFRelease(C.CFTypeRef(appleErr))
 		cStr := C.CFStringGetCStringPtr(appleErr, C.kCFStringEncodingUTF8)
@@ -139,22 +195,134 @@ func main() {
 	defer C.CFRelease(data)
 
 	count := C.CFArrayGetCount(C.CFArrayRef(data))
-	fmt.Println(count)
 	for i := C.CFIndex(0); i < count; i++ {
 		p := C.CFArrayGetValueAtIndex(C.CFArrayRef(data), i)
 		item := C.CFDictionaryRef(p)
 		labelP := C.CFDictionaryGetValue(item, unsafe.Pointer(C.kSecAttrLabel))
+		var label string
 		if labelP != nil {
 			cfLabel := C.CFStringRef(labelP)
 			cLabel := C.CFStringGetCStringPtr(cfLabel, C.kCFStringEncodingUTF8)
 			if cLabel != nil {
-				fmt.Println(C.GoString(cLabel))
+				label = C.GoString(cLabel)
 			} else {
-				fmt.Println("no c string?")
-				C.CFShow(C.CFTypeRef(cfLabel))
+				label = "<nil>"
 			}
 		} else {
-			fmt.Println("no label???")
+			label = "<nil>"
 		}
+		fmt.Printf("label: %s\n", label)
+
+		appLabelRef := C.CFDictionaryGetValue(item, unsafe.Pointer(C.kSecAttrApplicationLabel))
+		var appLabel string
+		if appLabelRef != nil {
+			lblStart := C.CFDataGetBytePtr(C.CFDataRef(appLabelRef))
+			lbl := C.GoBytes(unsafe.Pointer(lblStart), C.int(C.CFDataGetLength(C.CFDataRef(appLabelRef))))
+			// C.CFRelease(C.CFTypeRef(appLabelRef))
+			appLabel = fmt.Sprintf("%x", lbl)
+		} else {
+			panic("this shouldn't be able to happen...")
+		}
+		fmt.Printf("key ID: %s\n", appLabel)
+
+		privRefP := C.CFDictionaryGetValue(item, unsafe.Pointer(C.kSecValueRef))
+		pubRef := C.SecKeyCopyPublicKey(C.SecKeyRef(privRefP))
+		if pubRef == 0 {
+			fmt.Println("bad bad bad bad SecKeyCopyPublicKey")
+			continue
+		}
+		defer C.CFRelease(C.CFTypeRef(pubRef))
+		var appleErr C.CFErrorRef
+		cfData := C.SecKeyCopyExternalRepresentation(C.SecKeyRef(pubRef), &appleErr)
+		if cfData == 0 || appleErr != 0 {
+			panic(getAppleError(appleErr))
+		}
+		derStart := C.CFDataGetBytePtr(cfData)
+		der := C.GoBytes(unsafe.Pointer(derStart), C.int(C.CFDataGetLength(cfData)))
+		C.CFRelease(C.CFTypeRef(cfData))
+
+		gk, err := parseANSIPub(der)
+		if err != nil {
+			panic(err)
+		}
+		sshPK, err := ssh.NewPublicKey(gk)
+		if err != nil {
+			panic(err)
+		}
+		fmt.Printf("public key: %s", string(ssh.MarshalAuthorizedKey(sshPK)))
+
+		fmt.Println("-----")
+	}
+}
+
+func deleteKey(appLabelStr string) error {
+	appLabel, err := hex.DecodeString(appLabelStr)
+	if err != nil {
+		return err
+	}
+	cLbl := C.CBytes(appLabel)
+	cfLbl := C.CFDataCreate(C.kCFAllocatorDefault, (*C.uchar)(cLbl), C.CFIndex(len(appLabel)))
+	defer C.CFRelease(C.CFTypeRef(cfLbl))
+	defer C.free(cLbl) // do i need to do both?
+
+	query := dictToCFDict(map[C.CFStringRef]interface{}{
+		C.kSecAttrTokenID:          C.kSecAttrTokenIDSecureEnclave,
+		C.kSecAttrApplicationLabel: cfLbl,
+		C.kSecClass:                C.kSecClassKey,
+		C.kSecReturnAttributes:     C.kCFBooleanTrue,
+		C.kSecMatchLimit:           C.kSecMatchLimitAll,
+	})
+	defer C.CFRelease(C.CFTypeRef(query))
+	ret := C.SecItemDelete(query)
+	if ret != C.errSecSuccess {
+		if ret == -25300 {
+			fmt.Println("no matching key found")
+			return nil
+		}
+		appleErr := C.SecCopyErrorMessageString(ret, C.NULL)
+		defer C.CFRelease(C.CFTypeRef(appleErr))
+		cStr := C.CFStringGetCStringPtr(appleErr, C.kCFStringEncodingUTF8)
+		if cStr == nil {
+			fmt.Println("SecItemDelete failed: failed to read apple error")
+			os.Exit(1)
+		}
+		fmt.Printf("SecItemCopyDelete failed: %s\n", C.GoString(cStr))
+		os.Exit(1)
+	}
+	return nil
+}
+
+func main() {
+	generateFlags := flag.NewFlagSet("generate", flag.ExitOnError)
+	keyLabel := generateFlags.String("key-label", "", "Human readable key label")
+
+	deleteFlags := flag.NewFlagSet("delete", flag.ExitOnError)
+	keyID := deleteFlags.String("key-id", "", "key ID to delete (required)")
+
+	if len(os.Args) < 2 {
+		flag.Usage()
+		os.Exit(1)
+	}
+
+	switch os.Args[1] {
+	case "list":
+		listKeys()
+	case "generate":
+		generateFlags.Parse(os.Args[2:])
+		if *keyLabel == "" {
+			generateFlags.Usage()
+			os.Exit(1)
+		}
+		generateKey(*keyLabel)
+	case "delete":
+		deleteFlags.Parse(os.Args[2:])
+		if *keyID == "" {
+			deleteFlags.Usage()
+			os.Exit(1)
+		}
+		deleteKey(*keyID)
+	default:
+		flag.Usage()
+		os.Exit(1)
 	}
 }

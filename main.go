@@ -148,6 +148,7 @@ func getKeys() ([]seKey, error) {
 			fmt.Println("bad bad bad bad SecKeyCopyPublicKey")
 			continue
 		}
+		defer C.CFRelease(C.CFTypeRef(pubRefP))
 		var appleErr C.CFErrorRef
 		cfData := C.SecKeyCopyExternalRepresentation(pubRefP, &appleErr)
 		if cfData == 0 || appleErr != 0 {
