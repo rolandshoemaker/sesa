@@ -44,12 +44,23 @@ func dictToCFDict(m map[C.CFStringRef]interface{}) C.CFDictionaryRef {
 			values = append(values, unsafe.Pointer(t))
 		case C.CFStringRef:
 			values = append(values, unsafe.Pointer(t))
+		default:
+			panic("unsupported type passed to dictToCFDict")
 		}
 	}
 	return C.CFDictionaryCreate(C.kCFAllocatorDefault, &keys[0], &values[0], C.CFIndex(len(m)), &C.kCFTypeDictionaryKeyCallBacks, &C.kCFTypeDictionaryValueCallBacks)
 }
 
-// seKey satisfies crypto.Signer
+// cfDataToBytes extracts the contents of a CFDataRef into a []byte and
+// releases the reference
+func cfDataToBytes(dataRef C.CFDataRef) []byte {
+	b := C.GoBytes(unsafe.Pointer(C.CFDataGetBytePtr(dataRef)), C.int(C.CFDataGetLength(dataRef)))
+	C.CFRelease(C.CFTypeRef(dataRef))
+	return b
+}
+
+// seKey satisfies crypto.Signer rather than ssh.Signer. Probably it
+// could satisfy the latter instead, which might reduce some complexity?
 type seKey struct {
 	agent.Key
 	pk  crypto.PublicKey
@@ -60,14 +71,18 @@ func (sk *seKey) Public() crypto.PublicKey {
 	return sk.pk
 }
 
+// getAppleError extracts a human readable error from a CFErrorRef and
+// releases the reference
 func getAppleError(appleErr C.CFErrorRef) string {
+	defer C.CFRelease(C.CFTypeRef(appleErr))
 	cfStr := C.CFErrorCopyDescription(appleErr)
 	defer C.CFRelease(C.CFTypeRef(cfStr))
+	// I _think_ apple handles the memory management here,
+	// we shouldn't need to free cStr.
 	cStr := C.CFStringGetCStringPtr(cfStr, C.kCFStringEncodingUTF8)
 	if cStr == nil {
 		return "failed to read apple error"
 	}
-	C.CFRelease(C.CFTypeRef(appleErr))
 	return C.GoString(cStr)
 }
 
@@ -75,22 +90,22 @@ func (sk *seKey) Sign(rand io.Reader, digest []byte, opts crypto.SignerOpts) (si
 	cDigest := C.CBytes(digest)
 	cfDigest := C.CFDataCreate(C.kCFAllocatorDefault, (*C.uchar)(cDigest), C.CFIndex(len(digest)))
 	defer C.CFRelease(C.CFTypeRef(cfDigest))
-	defer C.free(cDigest) // do i need to do both?
+	defer C.free(cDigest)
 	var appleErr C.CFErrorRef
 	cfSig := C.SecKeyCreateSignature(sk.ref, C.kSecKeyAlgorithmECDSASignatureDigestX962SHA256, cfDigest, &appleErr)
 	if cfSig == 0 || appleErr != 0 {
-		fmt.Println("bad bad bad", appleErr)
 		return nil, fmt.Errorf("SecKeyCreateSignature failed: %s", getAppleError(appleErr))
 	}
-	sig := C.GoBytes(unsafe.Pointer(C.CFDataGetBytePtr(cfSig)), C.int(C.CFDataGetLength(cfSig)))
-	C.CFRelease(C.CFTypeRef(cfSig))
-	return sig, nil
+	return cfDataToBytes(cfSig), nil
 }
 
 // parseANSIPub parses a ANSI X9.63 format public key
 func parseANSIPub(b []byte) (*ecdsa.PublicKey, error) {
 	if len(b) != 65 {
-		return nil, errors.New("unexpected key length")
+		return nil, errors.New("unexpected public key length")
+	}
+	if b[0] != 0x04 {
+		return nil, errors.New("unexpected public key format")
 	}
 	xBytes, yBytes := b[1:33], b[33:]
 	return &ecdsa.PublicKey{
@@ -137,7 +152,7 @@ func getKeys() ([]seKey, error) {
 			cfLabel := C.CFStringRef(labelP)
 			cLabel := C.CFStringGetCStringPtr(cfLabel, C.kCFStringEncodingUTF8)
 			if cLabel != nil {
-				k.Comment = fmt.Sprintf("SE key: %s", C.GoString(cLabel))
+				k.Comment = C.GoString(cLabel)
 			}
 		}
 
@@ -145,7 +160,7 @@ func getKeys() ([]seKey, error) {
 		k.ref = C.SecKeyRef(privRefP)
 		pubRefP := C.SecKeyCopyPublicKey(C.SecKeyRef(privRefP))
 		if pubRefP == 0 {
-			fmt.Println("bad bad bad bad SecKeyCopyPublicKey")
+			log.Printf("SecKeyCopyPublicKey failed for key %q\n", k.Comment)
 			continue
 		}
 		defer C.CFRelease(C.CFTypeRef(pubRefP))
@@ -158,24 +173,27 @@ func getKeys() ([]seKey, error) {
 			C.CFRelease(C.CFTypeRef(appleErr))
 			continue
 		}
-		derStart := C.CFDataGetBytePtr(cfData)
-		der := C.GoBytes(unsafe.Pointer(derStart), C.int(C.CFDataGetLength(cfData)))
-		C.CFRelease(C.CFTypeRef(cfData))
+		der := cfDataToBytes(cfData)
 
 		gk, err := parseANSIPub(der)
 		if err != nil {
-			fmt.Println(err)
+			log.Printf("failed to parse extracted public key for key %q: %s\n", k.Comment, err)
 			continue
 		}
 		k.pk = gk
 		sshPK, err := ssh.NewPublicKey(gk)
 		if err != nil {
-			fmt.Println(err)
+			log.Printf("failed to parse extracted public key for key %q: %s\n", k.Comment, err)
 			continue
 		}
 		k.Format = sshPK.Type()
 		k.Blob = sshPK.Marshal()
-		C.CFRetain(C.CFTypeRef(k.ref)) // hold onto the SecKeyRef until we know we don't need it
+		// TODO: We should only really retain the reference if getKeys is being called from
+		// Sign. Otherwise there is no need and it can just be released along with the rest
+		// of the CFArray we got back from SecItemCopyMatching.
+		//
+		// hold onto the SecKeyRef until we know we don't need it
+		C.CFRetain(C.CFTypeRef(k.ref))
 		keys = append(keys, k)
 	}
 	return keys, nil
@@ -198,13 +216,25 @@ func (a *seAgent) List() ([]*agent.Key, error) {
 	return sshKeys, nil
 }
 
+func releaseKeys(keys []seKey) {
+	for _, k := range keys {
+		C.CFRelease(C.CFTypeRef(k.ref))
+	}
+}
+
 // Sign has the agent sign the data using a protocol 2 key as defined
 // in [PROTOCOL.agent] section 2.6.2.
 func (a *seAgent) Sign(key ssh.PublicKey, data []byte) (*ssh.Signature, error) {
+	// TODO: getKeys can look for only the key we care about since the
+	// application label on the key is just the hash of the public key.
+	// This means we'd only need to pull out a single SecKeyRef, rather
+	// than one for every key in the enclave (with the associated
+	// keychain-access-group label).
 	keys, err := getKeys()
 	if err != nil {
 		return nil, err
 	}
+	defer releaseKeys(keys)
 	pkBytes := key.Marshal()
 	for _, k := range keys {
 		if bytes.Equal(k.Blob, pkBytes) {
@@ -219,21 +249,9 @@ func (a *seAgent) Sign(key ssh.PublicKey, data []byte) (*ssh.Signature, error) {
 	return nil, errors.New("unknown key")
 }
 
-// Signers returns signers for all the known keys.
+// Signers returns signers for all the known keys. It is not implemented.
 func (a *seAgent) Signers() ([]ssh.Signer, error) {
-	keys, err := getKeys()
-	if err != nil {
-		return nil, err
-	}
-	signers := make([]ssh.Signer, len(keys))
-	for i, k := range keys {
-		signer, err := ssh.NewSignerFromSigner(&k) // is this pointer loop brokenness?
-		if err != nil {
-			return nil, err
-		}
-		signers[i] = signer
-	}
-	return signers, nil
+	return nil, errUnimplemented
 }
 
 // Add adds a private key to the agent. It is not implemented.
