@@ -40,15 +40,27 @@ NSObject* accessControl(CFTypeRef protection, SecAccessControlCreateFlags flags)
 */
 import "C"
 
+// getAppleError extracts a human readable error from a CFErrorRef and
+// releases the reference
 func getAppleError(appleErr C.CFErrorRef) string {
+	defer C.CFRelease(C.CFTypeRef(appleErr))
 	cfStr := C.CFErrorCopyDescription(appleErr)
 	defer C.CFRelease(C.CFTypeRef(cfStr))
+	// I _think_ apple handles the memory management here,
+	// we shouldn't need to free cStr.
 	cStr := C.CFStringGetCStringPtr(cfStr, C.kCFStringEncodingUTF8)
 	if cStr == nil {
 		return "failed to read apple error"
 	}
-	C.CFRelease(C.CFTypeRef(appleErr))
 	return C.GoString(cStr)
+}
+
+// cfDataToBytes extracts the contents of a CFDataRef into a []byte and
+// releases the reference
+func cfDataToBytes(dataRef C.CFDataRef) []byte {
+	b := C.GoBytes(unsafe.Pointer(C.CFDataGetBytePtr(dataRef)), C.int(C.CFDataGetLength(dataRef)))
+	C.CFRelease(C.CFTypeRef(dataRef))
+	return b
 }
 
 // parseANSIPub parses a ANSI X9.63 format public key
@@ -149,9 +161,7 @@ func generateKey(keyLabel string) {
 	if cfData == 0 || appleErr != 0 {
 		panic(getAppleError(appleErr))
 	}
-	derStart := C.CFDataGetBytePtr(cfData)
-	der := C.GoBytes(unsafe.Pointer(derStart), C.int(C.CFDataGetLength(cfData)))
-	C.CFRelease(C.CFTypeRef(cfData))
+	der := cfDataToBytes(cfData)
 
 	gk, err := parseANSIPub(der)
 	if err != nil {
@@ -216,10 +226,8 @@ func listKeys() {
 		appLabelRef := C.CFDictionaryGetValue(item, unsafe.Pointer(C.kSecAttrApplicationLabel))
 		var appLabel string
 		if appLabelRef != nil {
-			lblStart := C.CFDataGetBytePtr(C.CFDataRef(appLabelRef))
-			lbl := C.GoBytes(unsafe.Pointer(lblStart), C.int(C.CFDataGetLength(C.CFDataRef(appLabelRef))))
-			// C.CFRelease(C.CFTypeRef(appLabelRef))
-			appLabel = fmt.Sprintf("%x", lbl)
+			lbl := cfDataToBytes(C.CFDataRef(appLabelRef))
+			appLabel = hex.EncodeToString(lbl)
 		} else {
 			panic("this shouldn't be able to happen...")
 		}
@@ -237,9 +245,7 @@ func listKeys() {
 		if cfData == 0 || appleErr != 0 {
 			panic(getAppleError(appleErr))
 		}
-		derStart := C.CFDataGetBytePtr(cfData)
-		der := C.GoBytes(unsafe.Pointer(derStart), C.int(C.CFDataGetLength(cfData)))
-		C.CFRelease(C.CFTypeRef(cfData))
+		der := cfDataToBytes(cfData)
 
 		gk, err := parseANSIPub(der)
 		if err != nil {
