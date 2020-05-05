@@ -5,6 +5,8 @@ import (
 	"crypto"
 	"crypto/ecdsa"
 	"crypto/elliptic"
+	"crypto/sha1"
+	"encoding/binary"
 	"errors"
 	"flag"
 	"fmt"
@@ -43,6 +45,8 @@ func dictToCFDict(m map[C.CFStringRef]interface{}) C.CFDictionaryRef {
 		case C.CFBooleanRef:
 			values = append(values, unsafe.Pointer(t))
 		case C.CFStringRef:
+			values = append(values, unsafe.Pointer(t))
+		case C.CFDataRef:
 			values = append(values, unsafe.Pointer(t))
 		default:
 			panic("unsupported type passed to dictToCFDict")
@@ -115,9 +119,8 @@ func parseANSIPub(b []byte) (*ecdsa.PublicKey, error) {
 	}, nil
 }
 
-func getKeys() ([]seKey, error) {
-	var data C.CFTypeRef
-	query := dictToCFDict(map[C.CFStringRef]interface{}{
+func getKeys(keyHash []byte) ([]seKey, error) {
+	queryParams := map[C.CFStringRef]interface{}{
 		C.kSecAttrTokenID:      C.kSecAttrTokenIDSecureEnclave,
 		C.kSecClass:            C.kSecClassKey,
 		C.kSecAttrKeyClass:     C.kSecAttrKeyClassPrivate,
@@ -125,8 +128,17 @@ func getKeys() ([]seKey, error) {
 		C.kSecReturnRef:        C.kCFBooleanTrue,
 		C.kSecReturnAttributes: C.kCFBooleanTrue,
 		C.kSecMatchLimit:       C.kSecMatchLimitAll,
-	})
+	}
+	if keyHash != nil {
+		cLbl := C.CBytes(keyHash)
+		defer C.free(cLbl)
+		cfLbl := C.CFDataCreate(C.kCFAllocatorDefault, (*C.uchar)(cLbl), C.CFIndex(len(keyHash)))
+		defer C.CFRelease(C.CFTypeRef(cfLbl))
+		queryParams[C.kSecAttrApplicationLabel] = cfLbl
+	}
+	query := dictToCFDict(queryParams)
 	defer C.CFRelease(C.CFTypeRef(query))
+	var data C.CFTypeRef
 	ret := C.SecItemCopyMatching(query, &data)
 	if ret != C.errSecSuccess {
 		appleErr := C.SecCopyErrorMessageString(ret, C.NULL)
@@ -140,9 +152,11 @@ func getKeys() ([]seKey, error) {
 	defer C.CFRelease(data)
 
 	count := C.CFArrayGetCount(C.CFArrayRef(data))
+	if keyHash != nil && count != 1 {
+		return nil, fmt.Errorf("Unexpected number of keys, wanted 1, got %d", count)
+	}
 
 	var keys []seKey
-
 	for i := C.CFIndex(0); i < count; i++ {
 		var k seKey
 		p := C.CFArrayGetValueAtIndex(C.CFArrayRef(data), i)
@@ -173,27 +187,30 @@ func getKeys() ([]seKey, error) {
 			C.CFRelease(C.CFTypeRef(appleErr))
 			continue
 		}
-		der := cfDataToBytes(cfData)
+		ansiBytes := cfDataToBytes(cfData)
 
-		gk, err := parseANSIPub(der)
-		if err != nil {
-			log.Printf("failed to parse extracted public key for key %q: %s\n", k.Comment, err)
+		x, y := elliptic.Unmarshal(elliptic.P256(), ansiBytes)
+		if x == nil || y == nil {
+			log.Printf("failed to parse extracted public key for key %q\n", k.Comment)
 			continue
 		}
-		k.pk = gk
-		sshPK, err := ssh.NewPublicKey(gk)
+		k.pk = &ecdsa.PublicKey{
+			Curve: elliptic.P256(),
+			X:     x,
+			Y:     y,
+		}
+		sshPK, err := ssh.NewPublicKey(k.pk)
 		if err != nil {
 			log.Printf("failed to parse extracted public key for key %q: %s\n", k.Comment, err)
 			continue
 		}
 		k.Format = sshPK.Type()
 		k.Blob = sshPK.Marshal()
-		// TODO: We should only really retain the reference if getKeys is being called from
-		// Sign. Otherwise there is no need and it can just be released along with the rest
-		// of the CFArray we got back from SecItemCopyMatching.
-		//
-		// hold onto the SecKeyRef until we know we don't need it
-		C.CFRetain(C.CFTypeRef(k.ref))
+		if keyHash != nil {
+			// Only retain the SecKeyRef if getList was called from
+			// Sign and specified the key hash it was looking for.
+			C.CFRetain(C.CFTypeRef(k.ref))
+		}
 		keys = append(keys, k)
 	}
 	return keys, nil
@@ -201,52 +218,70 @@ func getKeys() ([]seKey, error) {
 
 // List returns the identities known to the agent.
 func (a *seAgent) List() ([]*agent.Key, error) {
-
-	seKeys, err := getKeys()
+	seKeys, err := getKeys(nil)
 	if err != nil {
 		return nil, err
 	}
 
 	sshKeys := make([]*agent.Key, len(seKeys))
 	for i := range seKeys {
-		C.CFRelease(C.CFTypeRef(seKeys[i].ref))
 		sshKeys[i] = &seKeys[i].Key
 	}
 
 	return sshKeys, nil
 }
 
-func releaseKeys(keys []seKey) {
-	for _, k := range keys {
-		C.CFRelease(C.CFTypeRef(k.ref))
+func hashPublicKey(key ssh.PublicKey) ([]byte, error) {
+	// unfortunately there is no way to directly access
+	// the ecdsa.PublicKey that underlies the private
+	// ssh.ecdsaPublicKey type, so we need to Marshal
+	// it back to bytes and then parse the key bytes
+	// out ourselves.
+	marshalled := bytes.TrimPrefix(key.Marshal(), []byte("ecdsa-sha2-nistp256"))
+	preambleLen := binary.BigEndian.Uint32(marshalled)
+	marshalled = marshalled[4:]
+	if uint32(len(marshalled)) < preambleLen {
+		return nil, errors.New("unable to parse ssh key")
 	}
+	marshalled = marshalled[preambleLen:]
+	var components struct {
+		Curve    string
+		KeyBytes []byte
+		Rest     []byte `ssh:"rest"`
+	}
+	err := ssh.Unmarshal(marshalled, &components)
+	if err != nil {
+		return nil, err
+	}
+	h := sha1.Sum(components.KeyBytes)
+	return h[:], nil
 }
 
 // Sign has the agent sign the data using a protocol 2 key as defined
 // in [PROTOCOL.agent] section 2.6.2.
 func (a *seAgent) Sign(key ssh.PublicKey, data []byte) (*ssh.Signature, error) {
-	// TODO: getKeys can look for only the key we care about since the
-	// application label on the key is just the hash of the public key.
-	// This means we'd only need to pull out a single SecKeyRef, rather
-	// than one for every key in the enclave (with the associated
-	// keychain-access-group label).
-	keys, err := getKeys()
+	if key.Type() != "ecdsa-sha2-nistp256" {
+		return nil, errors.New("unsupported type key")
+	}
+	keyHash, err := hashPublicKey(key)
+	if err != nil {
+		// unlikely we'll ever get here...
+		return nil, fmt.Errorf("couldnn't hash key: %s", err)
+	}
+
+	keys, err := getKeys(keyHash)
 	if err != nil {
 		return nil, err
 	}
-	defer releaseKeys(keys)
-	pkBytes := key.Marshal()
-	for _, k := range keys {
-		if bytes.Equal(k.Blob, pkBytes) {
-			signer, err := ssh.NewSignerFromSigner(&k)
-			if err != nil {
-				return nil, err
-			}
-			return signer.Sign(nil, data)
-		}
+	if len(keys) != 1 {
+		return nil, errors.New("unexpected number of keys")
 	}
-
-	return nil, errors.New("unknown key")
+	defer C.CFRelease(C.CFTypeRef(keys[0].ref))
+	signer, err := ssh.NewSignerFromSigner(&keys[0])
+	if err != nil {
+		return nil, err
+	}
+	return signer.Sign(nil, data)
 }
 
 // Signers returns signers for all the known keys. It is not implemented.
