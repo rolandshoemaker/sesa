@@ -4,10 +4,8 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"encoding/hex"
-	"errors"
 	"flag"
 	"fmt"
-	"math/big"
 	"os"
 	"unsafe"
 
@@ -55,25 +53,10 @@ func getAppleError(appleErr C.CFErrorRef) string {
 	return C.GoString(cStr)
 }
 
-// cfDataToBytes extracts the contents of a CFDataRef into a []byte and
-// releases the reference
+// cfDataToBytes extracts the contents of a CFDataRef into a []byte
 func cfDataToBytes(dataRef C.CFDataRef) []byte {
 	b := C.GoBytes(unsafe.Pointer(C.CFDataGetBytePtr(dataRef)), C.int(C.CFDataGetLength(dataRef)))
-	C.CFRelease(C.CFTypeRef(dataRef))
 	return b
-}
-
-// parseANSIPub parses a ANSI X9.63 format public key
-func parseANSIPub(b []byte) (*ecdsa.PublicKey, error) {
-	if len(b) != 65 {
-		return nil, errors.New("unexpected key length")
-	}
-	xBytes, yBytes := b[1:33], b[33:]
-	return &ecdsa.PublicKey{
-		Curve: elliptic.P256(),
-		X:     big.NewInt(0).SetBytes(xBytes),
-		Y:     big.NewInt(0).SetBytes(yBytes),
-	}, nil
 }
 
 func dictToCFDict(m map[C.CFStringRef]interface{}) C.CFDictionaryRef {
@@ -161,13 +144,18 @@ func generateKey(keyLabel string) {
 	if cfData == 0 || appleErr != 0 {
 		panic(getAppleError(appleErr))
 	}
-	der := cfDataToBytes(cfData)
+	ansiBytes := cfDataToBytes(cfData)
+	C.CFRelease(C.CFTypeRef(cfData))
 
-	gk, err := parseANSIPub(der)
-	if err != nil {
-		panic(err)
+	x, y := elliptic.Unmarshal(elliptic.P256(), ansiBytes)
+	if x == nil || y == nil {
+		panic("failed to parse extracted public key")
 	}
-	sshPK, err := ssh.NewPublicKey(gk)
+	sshPK, err := ssh.NewPublicKey(&ecdsa.PublicKey{
+		Curve: elliptic.P256(),
+		X:     x,
+		Y:     y,
+	})
 	if err != nil {
 		panic(err)
 	}
@@ -245,13 +233,18 @@ func listKeys() {
 		if cfData == 0 || appleErr != 0 {
 			panic(getAppleError(appleErr))
 		}
-		der := cfDataToBytes(cfData)
+		ansiBytes := cfDataToBytes(cfData)
+		C.CFRelease(C.CFTypeRef(cfData))
 
-		gk, err := parseANSIPub(der)
-		if err != nil {
-			panic(err)
+		x, y := elliptic.Unmarshal(elliptic.P256(), ansiBytes)
+		if x == nil || y == nil {
+			panic("failed to parse extracted public key")
 		}
-		sshPK, err := ssh.NewPublicKey(gk)
+		sshPK, err := ssh.NewPublicKey(&ecdsa.PublicKey{
+			Curve: elliptic.P256(),
+			X:     x,
+			Y:     y,
+		})
 		if err != nil {
 			panic(err)
 		}
@@ -300,7 +293,7 @@ func deleteKey(appLabelStr string) error {
 
 func main() {
 	generateFlags := flag.NewFlagSet("generate", flag.ExitOnError)
-	keyLabel := generateFlags.String("key-label", "", "Human readable key label")
+	keyLabel := generateFlags.String("key-label", "", "Human readable key label (minimum 10 characters)")
 
 	deleteFlags := flag.NewFlagSet("delete", flag.ExitOnError)
 	keyID := deleteFlags.String("key-id", "", "key ID to delete (required)")
@@ -317,6 +310,9 @@ func main() {
 		generateFlags.Parse(os.Args[2:])
 		if *keyLabel == "" {
 			generateFlags.Usage()
+			os.Exit(1)
+		} else if len(*keyLabel) < 10 {
+			fmt.Println("macOS requires key labels be at least 10 characters long (who knows why)")
 			os.Exit(1)
 		}
 		generateKey(*keyLabel)
